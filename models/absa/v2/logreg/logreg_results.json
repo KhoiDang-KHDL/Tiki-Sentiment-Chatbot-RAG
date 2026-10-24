@@ -1,0 +1,38 @@
+{
+    "description": {
+        "accuracy": 0.8571428571428571,
+        "precision_macro": 0.7697158392564368,
+        "recall_macro": 0.79761445054071,
+        "f1_macro": 0.7828389316140077
+    },
+    "quality": {
+        "accuracy": 0.8535936113575865,
+        "precision_macro": 0.7967500049872193,
+        "recall_macro": 0.8223643089302186,
+        "f1_macro": 0.808035209467516
+    },
+    "packaging": {
+        "accuracy": 0.8979591836734694,
+        "precision_macro": 0.7651299798129609,
+        "recall_macro": 0.7545104040508357,
+        "f1_macro": 0.7593274589116001
+    },
+    "delivery": {
+        "accuracy": 0.8855368234250222,
+        "precision_macro": 0.760992851258338,
+        "recall_macro": 0.7948916250509721,
+        "f1_macro": 0.7759435959064654
+    },
+    "service": {
+        "accuracy": 0.8464951197870453,
+        "precision_macro": 0.7138345222852266,
+        "recall_macro": 0.7608377335879863,
+        "f1_macro": 0.7350865185803938
+    },
+    "price": {
+        "accuracy": 0.8899733806566105,
+        "precision_macro": 0.7881260144197749,
+        "recall_macro": 0.7858477937210752,
+        "f1_macro": 0.7864737792013013
+    }
+}

@@ -1,0 +1,4 @@
+# HTTP-only frontend: no torch, Qdrant, embeddings or provider SDKs.
+chainlit==2.12.0
+httpx==0.28.1
+python-dotenv==1.2.4

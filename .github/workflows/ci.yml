@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CHAINLIT_NO_TELEMETRY: 'true'
+  HF_HUB_OFFLINE: '1'
+  TOKENIZERS_PARALLELISM: 'false'
+  API_LOG_INTERACTIONS: 'false'
+
+jobs:
+  offline-tests:
+    name: Offline tests (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: |
+            requirements-ci.txt
+            requirements-runtime-api.txt
+            requirements-runtime-ui.txt
+      - name: Install test dependencies
+        run: |
+          python -m pip install -r requirements-ci.txt
+          python -m pip check
+      - name: Compile Python and validate configuration files
+        run: python -m scripts.ci_checks
+      - name: Run offline regression suite
+        run: python -m scripts.ci_tests
+      - name: Save test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: offline-tests-py${{ matrix.python }}
+          path: reports/ci/
+          if-no-files-found: warn
+          retention-days: 7
+
+  containers:
+    name: Docker and monitoring smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Validate GitHub Actions syntax
+        run: docker run --rm --network none -v "$PWD:/repo:ro" -w /repo rhysd/actionlint:1.7.7 -color
+      - name: Validate optional runtime Compose
+        run: |
+          cp .env.runtime.example .env.runtime
+          docker compose --env-file .env.runtime -f docker-compose.runtime.yml config --quiet
+      - name: Validate Prometheus configuration and alert rules
+        run: |
+          docker run --rm --network none --entrypoint promtool \
+            -v "$PWD/monitoring:/etc/prometheus:ro" \
+            prom/prometheus:v3.10.0 check config /etc/prometheus/prometheus.yml
+      - name: Build production HTTP UI
+        run: docker build -f docker/runtime-ui.Dockerfile -t tiki-ci-ui .
+      - name: Build isolated synthetic API for integration tests
+        run: docker build -f docker/ci.Dockerfile -t tiki-ci-api .
+      - name: Start temporary API and UI
+        run: |
+          docker network create tiki-ci
+          docker run -d --name tiki-ci-api --network tiki-ci \
+            -p 127.0.0.1:18000:8000 tiki-ci-api
+          docker run -d --name tiki-ci-ui --network tiki-ci \
+            -e API_BASE_URL=http://tiki-ci-api:8000 -p 127.0.0.1:18001:8001 tiki-ci-ui
+      - name: Check HTTP, SSE, metrics and UI-to-API connection
+        run: |
+          python3 scripts/ci_smoke.py --api http://127.0.0.1:18000 --ui http://127.0.0.1:18001
+          docker exec tiki-ci-ui python -m runtime.chatbot.container_check
+      - name: Collect container logs
+        if: always()
+        run: |
+          mkdir -p reports/ci
+          docker logs tiki-ci-api > reports/ci/api.log 2>&1 || true
+          docker logs tiki-ci-ui > reports/ci/ui.log 2>&1 || true
+      - name: Save integration results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: container-smoke
+          path: reports/ci/
+          retention-days: 7
+      - name: Clean up temporary containers
+        if: always()
+        run: |
+          docker rm -f tiki-ci-api tiki-ci-ui 2>/dev/null || true
+          docker network rm tiki-ci 2>/dev/null || true

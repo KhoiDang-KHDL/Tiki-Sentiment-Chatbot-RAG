@@ -1,0 +1,10 @@
+# Offline regression tests: no torch, model checkpoints or API keys required.
+-r requirements-runtime-ui.txt
+-r requirements-runtime-api.txt
+numpy==1.26.4
+pandas==2.2.3
+pyarrow==19.0.1
+qdrant-client==1.19.1
+requests==2.32.4
+prometheus-client==0.26.0
+PyYAML==6.0.3

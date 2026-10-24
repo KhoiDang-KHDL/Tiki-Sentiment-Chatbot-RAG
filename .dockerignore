@@ -1,0 +1,16 @@
+.git
+.env
+.env.*
+!.env.*.example
+!.env.example
+.venv*
+venv
+**/__pycache__
+**/*.pyc
+data
+models
+reports
+logs
+airflow/logs
+notebooks
+docs/images

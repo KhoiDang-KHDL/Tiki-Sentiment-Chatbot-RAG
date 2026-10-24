@@ -1,0 +1,31 @@
+groups:
+  - name: tiki-api
+    rules:
+      - alert: TikiAPIDown
+        expr: up{job="tiki-api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Tiki API is not reachable by Prometheus
+      - alert: TikiHTTPHighErrorRate
+        expr: sum(rate(tiki_http_requests_total{job="tiki-api",status=~"5.."}[5m])) / clamp_min(sum(rate(tiki_http_requests_total{job="tiki-api"}[5m])), 0.001) > 0.05
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: More than 5% of Tiki HTTP requests have server errors
+      - alert: TikiStreamFailures
+        expr: sum(rate(tiki_stream_outcomes_total{job="tiki-api",outcome!="completed"}[5m])) / clamp_min(sum(rate(tiki_stream_outcomes_total{job="tiki-api"}[5m])), 0.001) > 0.05
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Streaming failures include SSE error events even when HTTP is 200
+      - alert: TikiSlowResponses
+        expr: histogram_quantile(0.95, sum by (le) (rate(tiki_http_request_duration_seconds_bucket{job="tiki-api"}[5m]))) > 10
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: HTTP p95 including streaming exceeds 10 seconds

@@ -1,0 +1,21 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+rule_files:
+  - /etc/prometheus/alerts.yml
+scrape_configs:
+  - job_name: tiki-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['api:8000']
+        labels:
+          mode: real
+  - job_name: tiki-loadtest
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['api-loadtest:8000']
+        labels:
+          mode: synthetic
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']
