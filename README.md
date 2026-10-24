@@ -158,21 +158,35 @@ Evaluation sử dụng Groq làm LLM judge, nhận dữ liệu log có contexts 
 sản phẩm. Kết quả được ghi vào MLflow để theo dõi theo từng lần chạy.
 Luồng evaluator sử dụng retrieval trong `src/`; HTTP serving sử dụng `runtime/`.
 
-### 2.7. Continuous Integration
+### 2.7. CI/CD
 
-GitHub Actions tự chạy trên **push**, **pull request** hoặc manual dispatch:
+GitHub Actions với **self-hosted runner** trên server nội bộ được cấp, trigger khi push lên `main`:
 
-```text
-Push / Pull Request
-  ├─ Python 3.11: dependency check → static checks → offline tests
-  ├─ Python 3.12: dependency check → static checks → offline tests
-  └─ Docker: Compose / Prometheus validation
-             → HTTP UI + synthetic API build
-             → HTTP / SSE / metrics / UI-to-API smoke tests
+```
+git pull → chmod -R 777 data/ → docker-compose build api ui
+→ docker-compose up -d → restart airflow/scheduler/worker
+→ smoke test API (retry 30 lần × 5s) + UI → ✅ done
 ```
 
-CI chạy trên GitHub-hosted runners, lưu test summaries và container logs dưới dạng
-artifacts trong **7 ngày**.
+### 2.8 Infrastructure
+
+12 Docker Compose services trên shared network — server nội bộ được cấp (Ubuntu, 8 CPU, 9.7GB RAM):
+
+| Service | Image | Port |
+|---------|-------|------|
+| tiki-api | custom FastAPI | 8000 |
+| tiki-ui | custom Chainlit | 8001 |
+| tiki-qdrant | qdrant/qdrant | 6333 |
+| tiki-redis | redis:7-alpine | 6379 |
+| tiki-airflow | custom Airflow webserver | 8080 |
+| tiki-airflow-scheduler | custom Airflow | — |
+| tiki-airflow-worker | custom Airflow | — |
+| tiki-airflow-postgres | postgres:15 | 5432 |
+| tiki-mlflow | ghcr.io/mlflow/mlflow:v2.11.1 | 5000 |
+| tiki-prometheus | prom/prometheus | 9090 |
+| tiki-grafana | grafana/grafana | 3000 |
+| tiki-locust | locustio/locust | 8089 |
+
 
 ## 3. Kết quả đạt được
 
@@ -295,3 +309,9 @@ Host ports cấu hình qua env/Compose. Credentials Grafana runtime lấy từ `
 | Knowledge Base | Aggregate statistics, document building và Qdrant indexing |
 | Observability | Metrics, dashboards, alert rules và performance testing |
 | Automation | GitHub Actions regression và container integration checks |
+
+## 8. Limitations
+
+- **Domain hạn chế:** Knowledge Base chỉ chứa sản phẩm ngành Nhà cửa & Đời sống (~2,962 sản phẩm). Câu hỏi ngoài domain sẽ có chất lượng trả lời thấp hơn.
+- **Rate limit:** Groq API giới hạn 25 RPM — bottleneck thực khi nhiều user đồng thời.
+- **PhoBERT retraining:** Cần GPU để train lại, hiện dùng human-in-the-loop — DAG 3 phát hiện drift và gửi W&B alert để team can thiệp thủ công.
