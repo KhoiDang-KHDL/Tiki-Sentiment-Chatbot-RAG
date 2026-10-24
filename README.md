@@ -70,9 +70,9 @@ F1 macro trên sáu khía cạnh:
 |---|---:|---|
 | **PhoBERT** | **84,76%** | ABSA inference trong data pipeline |
 | Logistic Regression | 76,92% | Phân tích review với model mặc định của URL Analyzer |
-| MultiHeadBiGRU | 74,80% | Mô hình deep learning cho ABSA |
-| MultiHeadTextCNN | 74,34% | Mô hình deep learning cho ABSA |
-| Random Forest | 72,08% | Mô hình machine learning cho ABSA |
+| MultiHeadBiGRU | 74,80% | Baseline |
+| MultiHeadTextCNN | 74,34% | Baseline |
+| Random Forest | 72,08% | Baseline |
 
 Các chỉ số lấy từ bộ kết quả evaluation v2 được lưu cùng repository.
 
