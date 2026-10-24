@@ -1,193 +1,382 @@
-# Tiki Sentiment Chatbot RAG
+# 🛒 Tiki Sentiment Chatbot
 
-[![CI](https://github.com/KhoiDang-KHDL/Tiki-Sentiment-Chatbot-RAG/actions/workflows/ci.yml/badge.svg)](https://github.com/KhoiDang-KHDL/Tiki-Sentiment-Chatbot-RAG/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/Python-3.8+-blue)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.110-009688)](https://fastapi.tiangolo.com/)
+[![Airflow](https://img.shields.io/badge/Airflow-2.7-017CEE)](https://airflow.apache.org/)
+[![Docker](https://img.shields.io/badge/Docker-Compose-2496ED)](https://www.docker.com/)
+[![W&B](https://img.shields.io/badge/Tracking-W%26B-FFBE00)](https://wandb.ai/cs317-mlops-org)
 
-Hệ thống hỏi đáp sản phẩm Tiki kết hợp Retrieval-Augmented Generation và Aspect-Based
-Sentiment Analysis. Repository giữ mã tham khảo trong `src/` và bổ sung runtime từ
-[Tiki_ABSA](https://github.com/KhoiDang-KHDL/Tiki-Sentiment-Chatbot) trong `runtime/`.
+Hệ thống RAG Chatbot hỏi đáp sản phẩm Tiki kết hợp Aspect-Based Sentiment Analysis (ABSA). Người dùng có thể hỏi tự nhiên về sản phẩm ngành **Nhà cửa & Đời sống**, nhận phân tích cảm xúc theo 6 khía cạnh (chất lượng, giá cả, mô tả, dịch vụ, đóng gói, giao hàng), hoặc paste link sản phẩm Tiki để phân tích real-time.
 
-## 1. Kiến trúc
+**Môn học:** CS317 - Phát triển và vận hành hệ thống máy học  
+**GVHD:** TS. Đỗ Văn Tiến | **GVTH:** CN. Lê Trần Trọng Khiêm  
+**Trường:** Đại học Công nghệ Thông tin - ĐHQG TP.HCM
 
-```mermaid
-flowchart LR
-    UI[Chainlit HTTP UI] --> API[FastAPI]
-    API --> Retrieval[BGE-M3 retrieval]
-    Retrieval --> Qdrant[(Qdrant KB)]
-    API --> LLM[Google AI Studio / Groq]
-    API --> Analyzer[URL Analyzer / ABSA]
-    API --> Prometheus[Prometheus]
-    Prometheus --> Grafana[Grafana]
-    CSV[Review CSV] --> Incremental[Validate / label / merge / delta upsert]
-    Incremental --> Qdrant
+## 1. Kiến trúc hệ thống
+
+![Kiến trúc tổng quan](docs/images/architecture_overview.jpg)
+
+Hệ thống gồm 3 luồng chính hoạt động liên kết với nhau: **Data Pipeline** tự động hóa từ crawl → label → ABSA → cập nhật Knowledge Base; **Serving** xử lý câu hỏi real-time; và **MLOps Infrastructure** đảm bảo tracking, monitoring, CI/CD.
+
+![Tech Stack](docs/images/tech_stack.jpg)
+
+## 2. MLOps Pipeline
+
+Toàn bộ phần này được xây dựng và chạy trên server nội bộ được cấp, truy cập qua VPN mạng trường.
+
+### 2.1 Data Processing Pipeline
+
+![Data Pipeline](docs/images/data_pipeline.jpg)
+
+**Apache Airflow 2.7** với CeleryExecutor, Redis broker, PostgreSQL metadata backend điều phối 4 DAGs chạy tuần tự mỗi ngày:
+
+**DAG 1 — `tiki_only_sync_s3`**  
+Crawl dữ liệu từ Tiki API theo 3 module: product list (danh sách sản phẩm theo category), product detail (thông tin chi tiết), reviews (đánh giá người mua). Dữ liệu upload thẳng lên AWS S3 bucket `tiki-crawl-data`, phân chia theo ngày để hỗ trợ cả bulk load lẫn incremental update.
+
+**DAG 2 — `preprocess_pipeline`**  
+Download dữ liệu mới từ S3, làm sạch (loại bỏ noise, chuẩn hóa text), chuẩn bị input cho bước ABSA inference. DAG này xử lý dữ liệu incremental hàng ngày — dataset ban đầu (~13,000 reviews) đã được gán nhãn riêng qua AWS Lambda + SQS trong giai đoạn one-time setup.
+
+**DAG 3 — `absa_inference_pipeline`**  
+Chạy ABSA inference bằng PhoBERT ONNX trên dữ liệu đã xử lý. Sau inference, kiểm tra 2 điều kiện drift: số review mới ≥ 500 **hoặc** F1 score giảm > 5% so với baseline (0.848). Nếu trigger, ghi flag vào MLflow và gửi W&B alert để team ABSA can thiệp retrain.
+
+**DAG 4 — `kb_rebuild_pipeline`**  
+Incremental KB update: embed các documents mới bằng BGE-M3 ONNX → upsert vào Qdrant (xóa vectors cũ của product đó, thêm vectors mới), archive file đã xử lý để tránh reprocess, log metrics (vectors count, documents processed, update duration) vào MLflow.
+
+### 2.2 Model Training & Optimization
+
+5 mô hình ABSA được huấn luyện và so sánh bằng **W&B Hyperparameter Sweep**:
+
+| Model | Avg F1 (macro) | Vai trò |
+|-------|----------------|---------|
+| **PhoBERT v2** | **84.8%** | ABSA offline trong DAG 3 |
+| Logistic Regression | ~72% | ABSA realtime trong URL Analyzer |
+| MultiHeadBiGRU | ~70% | Baseline |
+| MultiHeadTextCNN | ~68% | Baseline |
+| Random Forest | ~65% | Baseline |
+
+PhoBERT config: `lr ∈ {2e-5, 5e-5}`, `batch_size ∈ {16, 32}`, `max_length=128`, `dropout ∈ {0.3, 0.5}`, optimizer AdamW, early stopping patience 5. W&B Model Registry lưu checkpoint tốt nhất.
+
+**ONNX Export:**
+- PhoBERT v2: `torch.onnx.export` opset 14, `max_length=128` — giảm latency inference đáng kể so với PyTorch gốc
+- BGE-M3: export dense encoder sang ONNX (`bge_m3_dense.onnx`), 1024-dim vectors — dùng ONNX Runtime CPU trong Airflow, không cần GPU
+
+### 2.3 Model Serving
+
+![Serving Flow](docs/images/serving_flow.jpg)
+
+**FastAPI** (port 8000, 2 uvicorn workers) là core của toàn bộ RAG logic:
+
+- Nhận query từ Chainlit → LLM detect intent (chitchat vs product query)
+- Với product query: LLM rewrite query theo conversation history → check **Redis cache** (TTL 1hr)
+- Cache miss: embed bằng **BGE-M3 ONNX** → **Qdrant hybrid search** (dense cosine + sparse BM25) → Groq LLaMA 3.3 70B sinh response
+- **OpenRouter** làm LLM fallback khi Groq hit rate limit (nhiều free models xoay vòng)
+- **Smart warm cache on startup**: tự extract brand names, categories, product names từ Qdrant → generate ~100 queries thật → cache trước, giảm cold start từ ~10s xuống ~16ms
+- Interaction logging ra `interactions.jsonl` sau mỗi request `/chat`
+
+**Chainlit** (port 8001):
+- Multi-turn conversation với session memory
+- **URL Analyzer**: nhận link Tiki → crawl realtime → **LogReg ABSA** phân tích 6 khía cạnh → trả kết quả ngay (LogReg được chọn thay PhoBERT vì inference ~1ms so với ~44s cho 100 reviews)
+- Settings: người dùng chọn ABSA model (PhoBERT ONNX / LogReg) tùy nhu cầu
+
+**Qdrant Knowledge Base:** 2,962 vectors, collection `tiki_kb`, 3 loại document (product_card, aspect_summary, representative_reviews), metadata filtering theo category và ABSA scores.
+
+### 2.4 Experiment Tracking
+
+**W&B** (org `cs317-mlops-org`) quản lý ABSA training:
+- Log tất cả training runs, metrics, artifacts
+- Hyperparameter Sweep tự động tìm config tốt nhất
+- Model Registry lưu PhoBERT checkpoint tốt nhất
+- Alert tự động khi DAG 3 phát hiện drift trigger
+
+**MLflow** (port 5000) track metrics vận hành:
+- Experiment `retrain_monitoring`: F1 hiện tại, số reviews mới, trigger flag (từ DAG 3)
+- Experiment `kb_update`: vectors count, documents processed, update duration (từ DAG 4)
+- Experiment `ragas_evaluation`: RAGAS scores theo từng lần chạy eval
+
+### 2.5 Monitoring
+
+**Prometheus** (port 9090) scrape endpoint `/metrics` từ FastAPI mỗi 15 giây, thu thập `http_requests_total`, `http_request_duration_seconds`, `up`.
+
+**Grafana** (port 3000) hiển thị 4 panels: Request Rate (req/s), Average Response Time (ms), Total Requests, Error Rate (%).
+
+### 2.6 Load Testing & Evaluation
+
+**Locust** (port 8089) load test endpoint `/chat` với 4 user class (NormalUser, PowerUser, StressUser, HealthMonitor). Kết quả: **tối đa 20 concurrent users** tại 0% failure rate. Bottleneck là Groq API rate limit (25 RPM), không phải infrastructure — giảm thiểu bằng Redis cache.
+
+**RAGAS** (20 domain-specific queries):
+
+| Metric | Score |
+|--------|-------|
+| Faithfulness | 0.494 |
+| Answer Relevancy | 0.145 |
+
+Kết quả log vào MLflow experiment `ragas_evaluation`.
+
+### 2.7 CI/CD
+
+GitHub Actions với **self-hosted runner** trên server nội bộ được cấp, trigger khi push lên `main`:
+
+```
+git pull → chmod -R 777 data/ → docker-compose build api ui
+→ docker-compose up -d → restart airflow/scheduler/worker
+→ smoke test API (retry 30 lần × 5s) + UI → ✅ done
 ```
 
-| Code tree | Nội dung | Cách chạy |
-|---|---|---|
-| `src/` | Training, crawler, serving và Airflow/S3 pipeline tham khảo | `docker-compose.yml` |
-| `runtime/` | API validation, HTTP UI, SSE, Google/Groq, metrics và incremental retry từ Tiki_ABSA | `docker-compose.runtime.yml` |
+### 2.8 Infrastructure
 
-Hai stack dùng dependency và namespace riêng. Không chạy hai writer trên cùng dữ liệu/collection.
-Runtime mới không tự thay thế các DAG của stack tham khảo.
+12 Docker Compose services trên shared network — server nội bộ được cấp (Ubuntu, 8 CPU, 9.7GB RAM):
 
-## 2. Thành phần giữ từ bản tham khảo
+| Service | Image | Port |
+|---------|-------|------|
+| tiki-api | custom FastAPI | 8000 |
+| tiki-ui | custom Chainlit | 8001 |
+| tiki-qdrant | qdrant/qdrant | 6333 |
+| tiki-redis | redis:7-alpine | 6379 |
+| tiki-airflow | custom Airflow webserver | 8080 |
+| tiki-airflow-scheduler | custom Airflow | — |
+| tiki-airflow-worker | custom Airflow | — |
+| tiki-airflow-postgres | postgres:15 | 5432 |
+| tiki-mlflow | ghcr.io/mlflow/mlflow:v2.11.1 | 5000 |
+| tiki-prometheus | prom/prometheus | 9090 |
+| tiki-grafana | grafana/grafana | 3000 |
+| tiki-locust | locustio/locust | 8089 |
 
-- Crawler danh sách sản phẩm, chi tiết và reviews; preprocessing.
-- ABSA training: LogReg, Random Forest, PhoBERT, TextCNN và BiGRU.
-- ONNX export cho PhoBERT/BGE-M3; retrieval Qdrant và Redis cache.
-- Airflow DAGs cho đồng bộ S3, preprocessing, inference và KB rebuild.
-- MLflow/W&B integration trong pipeline/training; Ragas evaluation script.
-- Docker Compose cho các service local; các báo cáo model JSON gốc.
 
-Source gốc: [sentiment-chatbot-mlops](https://github.com/phngahn/sentiment-chatbot-mlops).
-Provenance và danh sách thay đổi: [NOTICE.md](NOTICE.md), [PORTS.md](docs/PORTS.md).
+## 3. Hướng dẫn cài đặt
 
-## 3. Phần bổ sung từ Tiki_ABSA
+### Yêu cầu hệ thống
 
-| Phần bổ sung | Chức năng |
-|---|---|
-| HTTP UI | Chainlit gọi FastAPI; không load ML model hay giữ provider keys trong UI |
-| Request validation | Giới hạn query/top-k/history, validate filters và URL |
-| Streaming | SSE sources/token/done/error, phát hiện stream gián đoạn |
-| Provider lifecycle | Lazy clients, Google/Groq selection, fallback trước token đầu |
-| URL context | Context ID phía API, TTL một giờ, giữ sản phẩm cho câu hỏi tiếp nối |
-| Retrieval | Collection qua env, kiểm tra vector, cache namespace theo model/encoder |
-| Incremental KB | Backup/snapshots, stable IDs, idempotency và retry sau partial write |
-| Metrics | Full-response latency, TTFT và semantic stream outcomes |
-| Dashboard/alerts | Grafana provisioning; bốn Prometheus alert rules |
-| Safe load test | Fixture riêng; chặn LLM thật mặc định |
-| CI | Python 3.11/3.12 tests, static checks và Docker smoke |
+| | Tối thiểu | Khuyến nghị |
+|-|-----------|------------|
+| RAM | 8GB | 16GB |
+| Disk | 50GB | 100GB |
+| Docker | 24.x + Compose v2 | Latest |
+| OS | Ubuntu 20.04 / WSL2 | Ubuntu 22.04 |
 
-Checkpoint resolver hỗ trợ `models/absa/v2/<model>/` của bản tham khảo và
-`models/<model>/` của Tiki_ABSA. Xem [runtime setup](docs/RUNTIME.md).
+### Bước 1 — Clone repo
 
-## 4. ABSA và Knowledge Base
-
-Sáu khía cạnh: chất lượng, giá cả, mô tả, dịch vụ, đóng gói và giao hàng.
-Model outputs là negative/neutral/positive theo từng khía cạnh.
-
-| Artifact | Path mặc định của bản tham khảo |
-|---|---|
-| LogReg bundle | `models/absa/v2/logreg/logreg.pkl` |
-| PhoBERT checkpoint | `models/absa/v2/phobert/phobert.pt` |
-| PhoBERT ONNX + tokenizer | `models/absa/v2/phobert_onnx/` |
-| BGE-M3 ONNX + tokenizer, tùy chọn | `models/bge-m3-onnx/` |
-
-KB dùng documents `product_card`, `aspect_summary`, `review`; dense vectors 1.024/Cosine.
-Serving hiện truy vấn dense với metadata filters và ABSA reranking.
-Runtime incremental yêu cầu collection có cả dense/sparse schema và không tự tạo lại collection.
-
-Weights, dữ liệu và cache không có trong Git. Các JSON evaluation trong `models/`
-là artifact của bản tham khảo, không phải kết quả đo lại của runtime mới.
-
-## 5. Setup runtime mới
-
-Prerequisites: Docker Linux containers/Compose, KB đã index hoặc snapshot để restore,
-checkpoint/cache tương ứng. Các lệnh chạy từ repository root.
-
-```powershell
-git clone https://github.com/KhoiDang-KHDL/Tiki-Sentiment-Chatbot-RAG.git
-cd Tiki-Sentiment-Chatbot-RAG
-py -3.12 -m scripts.setup_runtime
+```bash
+git clone https://github.com/phngahn/sentiment-chatbot-mlops
+cd sentiment-chatbot-mlops
 ```
 
-Sửa `.env.runtime`: provider key, collection, ports và model settings.
-Script sinh Grafana password ngẫu nhiên; không commit file env thật.
+### Bước 2 — Cấu hình môi trường
 
-```powershell
-.\scripts\runtime.ps1 build
+```bash
+cp .env.example .env
 ```
 
-Runtime Compose tạo Qdrant volume mới theo project `tiki-rag-runtime`.
-Restore/index KB vào Qdrant này trước khi khởi động API, hoặc cấu hình đích Qdrant khác.
-Nó không sử dụng hay thay đổi volume của dự án Tiki_ABSA đang chạy.
+Điền các biến trong `.env`:
 
-```powershell
-.\scripts\runtime.ps1 start
-.\scripts\runtime.ps1 check
-.\scripts\runtime.ps1 status
+```env
+# LLM
+GROQ_API_KEY=gsk_...
+OPENROUTER_API_KEY=sk-or-...
+
+# AWS S3
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+AWS_DEFAULT_REGION=ap-southeast-1
+S3_BUCKET_NAME=tiki-crawl-data
+
+# W&B
+WANDB_API_KEY=...
+WANDB_ENTITY=cs317-mlops-org
+
+# Airflow
+AIRFLOW_UID=1000
+
+# Services (giữ nguyên nếu dùng Docker Compose)
+MLFLOW_TRACKING_URI=http://tiki-mlflow:5000
+QDRANT_HOST=tiki-qdrant
+QDRANT_PORT=6333
+REDIS_HOST=tiki-redis
+REDIS_PORT=6379
 ```
 
-API startup cần collection tồn tại. Clone/build không tự tạo dữ liệu/model.
-Đường dẫn canonical, cách index và chuyển stack: [RUNTIME.md](docs/RUNTIME.md).
+### Bước 3 — Chuẩn bị ONNX model files
 
-## 6. Services và endpoints
+ONNX model files không được commit lên git vì kích thước lớn. Cần đặt đúng cấu trúc:
 
-| Service | Port runtime mặc định |
-|---|---:|
-| FastAPI / Swagger | 8000 / `/docs` |
-| Chainlit | 8001 |
-| Qdrant | 6333 |
-| Prometheus | 9090 |
-| Grafana | 3000 |
-| Locust, profile loadtest | 8089 |
-
-Runtime host ports bind loopback; đổi trong `.env.runtime` khi máy đã có stack khác.
-
-| Endpoint runtime | Chức năng |
-|---|---|
-| `GET /health` | Qdrant/provider configuration |
-| `POST /search` | Retrieval, documents/sources, không gọi LLM |
-| `POST /chat` | Answer/sources |
-| `POST /chat/stream` | SSE sources/token/done/error |
-| `POST /analyze` | URL report và context_id |
-| `GET /metrics` | Prometheus metrics |
-
-## 7. Testing và CI
-
-```powershell
-py -3.12 -m venv .venv-ci
-.\.venv-ci\Scripts\python.exe -m pip install -r requirements-ci.txt
-.\.venv-ci\Scripts\python.exe -m scripts.ci_checks
-.\.venv-ci\Scripts\python.exe -X utf8 -m scripts.ci_tests
+```
+models/
+├── absa/
+│   └── v2/
+│       ├── phobert_onnx/
+│       │   └── phobert_absa.onnx       # ~1.5MB
+│       └── logreg/
+│           ├── logreg_model.pkl
+│           └── tfidf_vectorizer.pkl
+└── bge-m3-onnx/
+    └── bge_m3_dense.onnx               # ~550MB
 ```
 
-CI trên push/PR kiểm tra Python 3.11/3.12, cấu hình Compose/Prometheus, build HTTP UI và
-API fixture, smoke test HTTP/SSE/metrics và UI → API. Không cần keys/model để chạy CI.
-CI chưa xác nhận model thật, source DAG/S3 services hoặc full production ML image.
+Export lại nếu chưa có:
 
-```powershell
-.\scripts\runtime.ps1 locust
+```bash
+python scripts/convert_phobert_onnx.py
+python scripts/convert_bgem3_onnx.py
 ```
 
-Locust mặc định trỏ fixture không gọi provider. Monitoring/load testing:
-[monitoring/README.md](monitoring/README.md).
-Không sao chép benchmark của Tiki_ABSA sang repo này như kết quả đã đo lại.
+### Bước 4 — Build và khởi động
 
-## 8. Ragas và experiment tracking
+```bash
+# Build tất cả custom images (api, ui, airflow)
+docker compose build
 
-Giữ `scripts/ragas_eval.py` của bản tham khảo: faithfulness, answer relevancy và MLflow logging.
-Script dùng Groq, API/dependency đời cũ và `src.chatbot.retrieval`; không tự đánh giá
-runtime mới. Cần môi trường riêng và chủ động cho phép gọi provider khi chạy.
+# Khởi động toàn bộ 12 services
+docker compose up -d
 
-MLflow/W&B thuộc stack/pipeline tham khảo. Runtime mới chưa tích hợp evaluator Ragas
-qua API hoặc tự động đưa incremental metrics vào MLflow.
-
-## 9. Cấu trúc repository
-
-```text
-src/                         # Mã tham khảo: train, crawl, serving, KB
-runtime/                     # Runtime bổ sung, namespace độc lập
-  chatbot/                   # HTTP API/UI, retrieval, LLM, metrics
-  absa/                      # Inference + checkpoint layout compatibility
-  crawling/                  # Shared HTTP client, validation/error handling
-  preprocessing/             # Cleaner dùng chung với inference
-  knowledge_base/            # Resumable incremental update
-scripts/                     # Export/eval gốc + runtime/CI commands
-airflow/dags/                # Các DAG tham khảo
-s3_lambda/                   # Labeling/S3 integration tham khảo
-tests/                       # Runtime regression + Locust fixtures
-monitoring/                  # Prometheus/Grafana configs
-docker/                      # Original và runtime Dockerfiles
-docker-compose.yml           # Stack tham khảo
-docker-compose.runtime.yml   # Runtime bổ sung độc lập
-.github/workflows/ci.yml      # CI; không deploy server
-docs/                        # Runtime integration notes
+# Kiểm tra tất cả đang Up
+docker compose ps
 ```
 
-## 10. Giới hạn
+Đợi 2-3 phút để services sẵn sàng, đặc biệt `tiki-api` cần load ONNX models và warm cache.
 
-- Không có deployment server, CD hoặc hạ tầng cloud đi kèm repository này.
-- Runtime API phục vụ local, chưa có authentication/rate limiting.
-- Live Tiki/provider availability phụ thuộc mạng, quyền truy cập và quota.
-- Không chạy original Airflow KB writer đồng thời với runtime incremental.
-- Model compatibility, chất lượng ABSA/RAG và tải thực tế cần đánh giá trên artifact được cấp riêng.
+### Bước 5 — Khởi tạo Knowledge Base
+
+**Cách nhanh — restore từ Qdrant snapshot** (chạy trên máy đang host Docker):
+
+```bash
+curl -X POST "http://[SERVER_IP]:6333/collections/tiki_kb/snapshots/upload?priority=snapshot" \
+  -H "Content-Type: multipart/form-data" \
+  -F "snapshot=@tiki_kb.snapshot"
+
+# Kiểm tra
+curl -s http://[SERVER_IP]:6333/collections/tiki_kb | \
+  python3 -c "import sys,json; r=json.load(sys.stdin)['result']; print(f'Status: {r[\"status\"]}, Vectors: {r[\"points_count\"]}')"
+# → Status: green, Vectors: 2962
+```
+
+**Cách đầy đủ — chạy pipeline qua Airflow** (cần S3 data):
+
+Vào Airflow UI `http://[SERVER_IP]:8080`, trigger thủ công lần lượt: DAG 1 → DAG 2 → DAG 3 → DAG 4.
+
+## 4. Kiểm thử
+
+> Thay `[SERVER_IP]` bằng IP server nội bộ (VPN) hoặc `13.251.141.210` (cloud). Các lệnh `docker exec` và `docker compose` cần chạy trực tiếp trên máy đang host Docker.
+
+### Health check
+
+```bash
+# API
+curl http://[SERVER_IP]:8000/health
+# → {"status":"ok"}
+
+# Qdrant vectors count
+curl -s http://[SERVER_IP]:6333/collections/tiki_kb | \
+  python3 -c "import sys,json; print(json.load(sys.stdin)['result']['points_count'])"
+# → 2962
+
+# Redis (chạy trên Docker host)
+docker exec tiki-redis redis-cli PING
+# → PONG
+```
+
+### Test chatbot
+
+```bash
+# Câu hỏi thông thường
+curl -X POST http://[SERVER_IP]:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"query": "Nồi cơm điện nào tốt nhất?", "session_id": "test-001"}'
+
+# Multi-turn (cùng session_id)
+curl -X POST http://[SERVER_IP]:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"query": "So sánh với máy hút bụi thì sao?", "session_id": "test-001"}'
+
+# URL Analyzer
+curl -X POST http://[SERVER_IP]:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"query": "https://tiki.vn/noi-com-dien-abc", "session_id": "test-002"}'
+```
+
+### RAGAS evaluation (chạy trên Docker host)
+
+```bash
+docker exec tiki-api python /app/scripts/ragas_eval.py
+# Kết quả log vào MLflow → http://[SERVER_IP]:5000
+```
+
+### Load testing
+
+```bash
+# Qua Locust UI
+open http://[SERVER_IP]:8089
+
+# Headless (20 users, 2 phút) — chạy trên Docker host
+docker compose exec locust locust \
+  --headless -u 20 -r 2 --run-time 120s \
+  --host http://tiki-api:8000
+```
+
+### Kiểm tra Airflow DAGs (chạy trên Docker host)
+
+```bash
+# Xem logs
+docker compose logs tiki-airflow --tail=50
+
+# Vào UI để trigger/monitor
+open http://[SERVER_IP]:8080  # admin/admin
+```
+
+### Kiểm tra CloudWatch logs (cloud only)
+
+```bash
+aws logs describe-log-groups --region ap-southeast-1
+
+aws logs filter-log-events \
+  --log-group-name tiki-mlops \
+  --filter-pattern "ERROR" \
+  --region ap-southeast-1 \
+  --limit 20
+```
+
+## 5. Truy cập services
+
+| Service | Server nội bộ (VPN mạng trường) | Credentials |
+|---------|----------------------------------|-------------|
+| Chatbot UI | http://[server-ip]:8001 | — |
+| API Docs | http://[server-ip]:8000/docs | — |
+| Airflow | http://[server-ip]:8080 | admin/admin |
+| Grafana | http://[server-ip]:3000 | admin/admin |
+| MLflow | http://[server-ip]:5000 | — |
+| Prometheus | http://[server-ip]:9090 | — |
+| Locust | http://[server-ip]:8089 | — |
+
+
+## 6. Cấu trúc thư mục
+
+```
+sentiment-chatbot-mlops/
+├── src/
+│   ├── chatbot/
+│   │   ├── api.py              # FastAPI, warm cache, interaction logging
+│   │   ├── retrieval.py        # Hybrid search, Redis cache
+│   │   ├── llm.py              # Groq/OpenRouter, query rewriting, intent detection
+│   │   └── chatbot_ui.py       # Chainlit UI, URL Analyzer, multi-turn
+│   ├── absa/
+│   │   └── inference.py        # PhoBERT ONNX + LogReg predictor
+│   ├── crawling/               # Tiki crawler modules
+│   └── kb/
+│       ├── index_qdrant.py     # Full KB rebuild
+│       └── index_qdrant_delta.py # Incremental update
+├── dags/                       # 4 Airflow DAGs
+├── scripts/
+│   ├── convert_phobert_onnx.py
+│   ├── convert_bgem3_onnx.py
+│   └── ragas_eval.py
+├── models/                     # ONNX model files (gitignored)
+├── monitoring/                 # Prometheus config
+├── docker/                     # Dockerfiles
+├── tests/                      # Locust load test scripts
+├── docs/images/                # Architecture diagrams
+└── docker-compose.yml
+```
+
+## 9. Limitations
+
+- **Domain hạn chế:** Knowledge Base chỉ chứa sản phẩm ngành Nhà cửa & Đời sống (~2,962 sản phẩm). Câu hỏi ngoài domain sẽ có chất lượng trả lời thấp hơn.
+- **Rate limit:** Groq API giới hạn 25 RPM — bottleneck thực khi nhiều user đồng thời. Redis cache và OpenRouter fallback giảm thiểu nhưng không triệt tiêu.
+- **PhoBERT retraining:** Cần GPU để train lại, hiện dùng human-in-the-loop — DAG 3 phát hiện drift và gửi W&B alert để team can thiệp thủ công.
