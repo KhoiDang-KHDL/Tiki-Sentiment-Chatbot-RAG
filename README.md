@@ -74,14 +74,12 @@ F1 macro trên sáu khía cạnh:
 | MultiHeadTextCNN | 74,34% | Baseline |
 | Random Forest | 72,08% | Baseline |
 
-Các chỉ số lấy từ bộ kết quả evaluation v2 được lưu cùng repository.
 
-**PhoBERT optimization:** learning rate 2e-5/5e-5, batch size 16/32, max length 128,
-dropout 0.3/0.5, AdamW và early stopping. Training metrics và model artifacts được ghi
-nhận trên W&B.
+PhoBERT config: `lr ∈ {2e-5, 5e-5}`, `batch_size ∈ {16, 32}`, `max_length=128`, `dropout ∈ {0.3, 0.5}`, optimizer AdamW, early stopping patience 5. W&B Model Registry lưu checkpoint tốt nhất.
 
-**ONNX export:** hỗ trợ xuất PhoBERT và BGE-M3 dense encoder để sử dụng với ONNX Runtime.
-Checkpoint và tokenizer được tổ chức theo model/version, hỗ trợ lựa chọn khi inference.
+**ONNX Export:**
+- PhoBERT: `torch.onnx.export` opset 14, `max_length=128` — giảm latency inference đáng kể so với PyTorch gốc
+- BGE-M3: export dense encoder sang ONNX (`bge_m3_dense.onnx`), 1024-dim vectors — dùng ONNX Runtime CPU trong Airflow, không cần GPU
 
 ### 2.3. Model Serving
 
