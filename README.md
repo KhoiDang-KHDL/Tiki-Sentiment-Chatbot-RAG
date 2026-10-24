@@ -10,6 +10,8 @@ Hệ thống RAG Chatbot hỏi đáp sản phẩm Tiki kết hợp **Aspect-Base
 Người dùng có thể tìm kiếm sản phẩm, hỏi đáp theo ngữ cảnh hoặc gửi URL Tiki để nhận
 phân tích đánh giá theo **6 khía cạnh**: chất lượng, giá cả, mô tả, dịch vụ, đóng gói và giao hàng.
 
+Demo: [Video](https://drive.google.com/drive/folders/10pvr9gH1b9cp7Lck6WCGU8kd___Pctk3?usp=sharing)
+
 ## 1. Kiến trúc hệ thống
 
 ![Kiến trúc tổng quan](docs/images/architecture_overview.jpg)
@@ -18,7 +20,7 @@ Hệ thống gồm ba luồng chính:
 
 - **Data Pipeline:** thu thập review → làm sạch → ABSA inference → cập nhật Knowledge Base.
 - **Model Serving:** truy xuất tài liệu sản phẩm → tổng hợp bằng LLM → trả lời có nguồn qua giao diện chat.
-- **MLOps Infrastructure:** điều phối dữ liệu, experiment tracking, monitoring, load testing và CI.
+- **MLOps Infrastructure:** điều phối dữ liệu, experiment tracking, monitoring, load testing và CI/CD.
 
 ![Tech Stack](docs/images/tech_stack.jpg)
 
